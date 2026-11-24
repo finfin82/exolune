@@ -27,6 +27,12 @@ struct Settings
     // The clouds: always, unless MYPLANETENGINE_NO_CLOUDS (key N); in their temporal pass, unless
     // MYPLANETENGINE_CLOUD_FULL=1. Their weather starts at MYPLANETENGINE_WEATHER_TIME (s).
     bool clouds = true, cloudTemporal = true;
+    // MYPLANETENGINE_UPSCALER=off|fsr (default off: native TAA path).
+    int upscaler = 0;
+    // MYPLANETENGINE_FSR_QUALITY=quality|balanced|performance (used when upscaler=fsr).
+    int fsrQuality = 0;
+    // MYPLANETENGINE_RENDER_SCALE: 0 = from the quality preset, otherwise render/display (0.25-1).
+    float renderScale = 0.0f;
     double weatherTime = 0.0;
 
     // The sun: high in the sky over the default start, or MYPLANETENGINE_SUN="latitude longitude".

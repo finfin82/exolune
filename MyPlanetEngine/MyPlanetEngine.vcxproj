@@ -43,17 +43,27 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <Fsr2SdkDir>$(ProjectDir)..\third_party\FidelityFX-FSR2\sdk</Fsr2SdkDir>
+    <Fsr2ApiDir>$(Fsr2SdkDir)\src\ffx-fsr2-api</Fsr2ApiDir>
+    <Fsr2LibDir>$(Fsr2ApiDir)\bin\ffx_fsr2_api</Fsr2LibDir>
+    <HasFsr2Sdk Condition="Exists('$(Fsr2LibDir)\ffx_fsr2_api_x64.lib')">true</HasFsr2Sdk>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(HasFsr2Sdk)'=='true'">MYPLANETENGINE_HAS_FSR2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories Condition="'$(HasFsr2Sdk)'=='true'">$(Fsr2ApiDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasFsr2Sdk)'=='true'">ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx12_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories Condition="'$(HasFsr2Sdk)'=='true'">$(Fsr2LibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -66,7 +76,9 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(HasFsr2Sdk)'=='true'">MYPLANETENGINE_HAS_FSR2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories Condition="'$(HasFsr2Sdk)'=='true'">$(Fsr2ApiDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -75,6 +87,8 @@
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(HasFsr2Sdk)'=='true'">ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx12_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories Condition="'$(HasFsr2Sdk)'=='true'">$(Fsr2LibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -94,6 +108,7 @@
     <ClCompile Include="Glare.cpp" />
     <ClCompile Include="Scans.cpp" />
     <ClCompile Include="Settings.cpp" />
+    <ClCompile Include="Upscaler.cpp" />
     <ClCompile Include="PlanetFoliage.cpp" />
     <ClCompile Include="FoliageHiZ.cpp" />
     <ClCompile Include="PlanetPlantPlacement.cpp" />
@@ -738,6 +753,12 @@
       <EntryPointName>PSMain</EntryPointName>
       <DisableOptimizations>false</DisableOptimizations>
       <AdditionalInputs>OpticalSurface.hlsli;SceneExposure.hlsli;Celestial.hlsli;Coordinates.hlsli;Planet.hlsli;Atmosphere.hlsli;%(AdditionalInputs)</AdditionalInputs>
+    </FxCompile>
+    <FxCompile Include="Velocity.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <ShaderModel>6.0</ShaderModel>
+      <EntryPointName>PSMain</EntryPointName>
+      <DisableOptimizations>false</DisableOptimizations>
     </FxCompile>
     <FxCompile Include="CelestialBodies.hlsl">
       <ShaderType>Pixel</ShaderType><ShaderModel>6.0</ShaderModel><EntryPointName>PSMain</EntryPointName>

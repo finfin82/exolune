@@ -1,6 +1,7 @@
 // D3DApp.cpp - the application: the window, the device and its resources, the frame (Draw), the free camera and the
 // input. The benches, the test views and the ship are in D3DAppBench.cpp, D3DAppTests.cpp and D3DAppShip.cpp.
 #include "D3DApp.h"
+#include "Upscaler.h"
 #include "ObserverExposure.hlsli"
 #include "CelestialSystem.h"
 #include <d3d12sdklayers.h>
@@ -54,13 +55,17 @@ namespace
                              CitySrv = AirlessMaterialSrv + Celestial::AirlessAtlasSlots,
                              GlareSrv = CitySrv + City::DescriptorCount, // the summed glare, then an empty view without it
                              AdaptationSrv = GlareSrv + 2, // the local adaptation's pyramid (Adaptation.h)
-                             DescriptorCount = AdaptationSrv + 1 };
+                             VelocitySrv = AdaptationSrv + 1,
+                             CompositionSrv = VelocitySrv + 1,
+                             UpscaledSrv = CompositionSrv + 1,
+                             DepthBufferSrv = UpscaledSrv + 1,
+                             DescriptorCount = DepthBufferSrv + 1 };
     // Render target views: the back buffers, then the HDR image, the composite image, the two histories and the terrain's
     // sunlit part, for the clouds' shade.
     // Then the cloud temporal pass's fresh light and data, its two histories, light, data and offset each, and the light
     // and data of its drifted pixels.
     enum RenderTarget : UINT { HdrRtv = 2, CompositeRtv = 3, HistoryRtv = 4, SunRtv = 6, CloudFreshRtv = 7,
-                               CloudHistoryRtv = 9, CloudHalfRtv = 15, SkyTransportRtv = 17, CelestialRtv = 18, RtvCount = 19 };
+                               CloudHistoryRtv = 9, CloudHalfRtv = 15, SkyTransportRtv = 17, CelestialRtv = 18, VelocityRtv = 19, CompositionRtv = 20, RtvCount = 21 };
     // Must match Atmosphere.hlsli: each table's size, and its slices for the haze's ground, GROUND_SLICES.
     const UINT kLutSizes[3][2] = { { 256, 64 }, { 32, 32 }, { 64, 16 } }, kLutGroundSlices = 25;
 
@@ -345,6 +350,8 @@ D3DApp::D3DApp(HINSTANCE hInstance, double startAltitude, double latitude, doubl
     mTaa = mSettings.taa; // preference; TemporalAA bypasses diagnostics without resetting key T
     mDiagnosticView = mSettings.view;
     mCloudsOn = mSettings.clouds;
+    mUpscaler = mSettings.upscaler;
+    mFsrQuality = mSettings.fsrQuality;
     mCoordinates = mSettings.coordinates;
     mWeatherTime = mSettings.weatherTime;
     mLabel = mSettings.label;
@@ -434,6 +441,7 @@ void D3DApp::UpdateOceanPlane(double dt, const Vec3d& faceX, const Vec3d& faceY,
 
 D3DApp::~D3DApp() {
     if (mCommandQueue && mFence && mSwapChain) WaitForPreviousFrame();
+    mFsr.reset();
     if (mFenceEvent) CloseHandle(mFenceEvent);
 }
 
@@ -577,6 +585,10 @@ bool D3DApp::InitDirect3D() {
     if (!options.DoublePrecisionFloatShaderOps)
         throw std::runtime_error("This GPU has no double precision shader support, needed by the terrain noise.");
 
+    ChooseRenderSize();
+    // FSR context is created after the plant catalogue is uploaded: creating it earlier
+    // left PlanetFoliage::Initialize spinning on the CPU (command list recording).
+
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     Check(md3dDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&mCommandQueue)), "Command queue creation failed.");
@@ -618,7 +630,7 @@ bool D3DApp::InitDirect3D() {
 
     // The HDR image: render target for the scene, then shader resource for the tone map.
     CD3DX12_HEAP_PROPERTIES hdrHeapProps(D3D12_HEAP_TYPE_DEFAULT);
-    CD3DX12_RESOURCE_DESC hdrDesc = CD3DX12_RESOURCE_DESC::Tex2D(HdrFormat, mClientWidth, mClientHeight, 1, 1, 1, 0,
+    CD3DX12_RESOURCE_DESC hdrDesc = CD3DX12_RESOURCE_DESC::Tex2D(HdrFormat, mRenderWidth, mRenderHeight, 1, 1, 1, 0,
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     D3D12_CLEAR_VALUE hdrClear = {};
     hdrClear.Format = HdrFormat;
@@ -655,8 +667,19 @@ bool D3DApp::InitDirect3D() {
             D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&mAirlessMaterial[i])),"Airless material creation failed.");
         md3dDevice->CreateShaderResourceView(mAirlessMaterial[i].Get(),nullptr,cpuDescriptor(AirlessMaterialSrv+i));
     }
-    createImage(mHistory[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, HistoryRtv, HistorySrv);
-    createImage(mHistory[1], D3D12_RESOURCE_STATE_RENDER_TARGET, HistoryRtv + 1, HistorySrv + 1);
+    // History is always display-sized: ToneMap writes the swapchain and history together.
+    // When the upscaler is off, render and display sizes already match.
+    CD3DX12_RESOURCE_DESC historyDesc = CD3DX12_RESOURCE_DESC::Tex2D(HdrFormat, mClientWidth, mClientHeight, 1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto createHistory = [&](ComPtr<ID3D12Resource>& image, D3D12_RESOURCE_STATES state, UINT rtv, UINT srv) {
+        Check(md3dDevice->CreateCommittedResource(&hdrHeapProps, D3D12_HEAP_FLAG_NONE, &historyDesc, state, &hdrClear,
+            IID_PPV_ARGS(&image)), "History image creation failed.");
+        md3dDevice->CreateRenderTargetView(image.Get(), nullptr,
+            CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart(), rtv, mRtvDescriptorSize));
+        md3dDevice->CreateShaderResourceView(image.Get(), nullptr, cpuDescriptor(srv));
+    };
+    createHistory(mHistory[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, HistoryRtv, HistorySrv);
+    createHistory(mHistory[1], D3D12_RESOURCE_STATE_RENDER_TARGET, HistoryRtv + 1, HistorySrv + 1);
 
     // The cloud temporal pass (CloudsTemporal.hlsli): fresh tiles, one texel per 4x4 pixels, the drifted pixels,
     // one texel per 2x2, and two full histories; light and transmittance in half floats, distances in floats, and the
@@ -674,14 +697,14 @@ bool D3DApp::InitDirect3D() {
                 CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart(), rtv, mRtvDescriptorSize));
         };
         for (UINT i = 0; i < 2; ++i) {
-            createCloudImage(mCloudFresh[i], i, (mClientWidth + CloudTileX - 1) / CloudTileX,
-                (mClientHeight + CloudTileY - 1) / CloudTileY, D3D12_RESOURCE_STATE_RENDER_TARGET, CloudFreshRtv + i);
-            createCloudImage(mCloudFresh[2 + i], i, (mClientWidth + 1) / 2, (mClientHeight + 1) / 2,
+            createCloudImage(mCloudFresh[i], i, (mRenderWidth + CloudTileX - 1) / CloudTileX,
+                (mRenderHeight + CloudTileY - 1) / CloudTileY, D3D12_RESOURCE_STATE_RENDER_TARGET, CloudFreshRtv + i);
+            createCloudImage(mCloudFresh[2 + i], i, (mRenderWidth + 1) / 2, (mRenderHeight + 1) / 2,
                 D3D12_RESOURCE_STATE_RENDER_TARGET, CloudHalfRtv + i);
         }
         for (UINT h = 0; h < 2; ++h)
             for (UINT i = 0; i < 3; ++i)
-                createCloudImage(mCloudHistory[h][i], i, mClientWidth, mClientHeight, h == 0
+                createCloudImage(mCloudHistory[h][i], i, mRenderWidth, mRenderHeight, h == 0
                     ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET, CloudHistoryRtv + 3 * h + i);
         for (UINT h = 0; h < 2; ++h) // t44..t50
             for (UINT i = 0; i < 7; ++i)
@@ -726,7 +749,7 @@ bool D3DApp::InitDirect3D() {
     {
         D3D12_CLEAR_VALUE sunClear = {};
         sunClear.Format = SunFormat;
-        const CD3DX12_RESOURCE_DESC sunDesc = CD3DX12_RESOURCE_DESC::Tex2D(SunFormat, mClientWidth, mClientHeight, 1, 1, 1, 0,
+        const CD3DX12_RESOURCE_DESC sunDesc = CD3DX12_RESOURCE_DESC::Tex2D(SunFormat, mRenderWidth, mRenderHeight, 1, 1, 1, 0,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         Check(md3dDevice->CreateCommittedResource(&hdrHeapProps, D3D12_HEAP_FLAG_NONE, &sunDesc, D3D12_RESOURCE_STATE_RENDER_TARGET,
             &sunClear, IID_PPV_ARGS(&mSunPart)), "Sunlit part creation failed.");
@@ -736,7 +759,7 @@ bool D3DApp::InitDirect3D() {
         md3dDevice->CreateUnorderedAccessView(mSunPart.Get(),nullptr,nullptr,cpuDescriptor(ContactSunUav));
     }
     {
-        const auto desc=CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16_FLOAT,(mClientWidth+1)/2,(mClientHeight+1)/2,1,1,1,0,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const auto desc=CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16_FLOAT,(mRenderWidth+1)/2,(mRenderHeight+1)/2,1,1,1,0,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         Check(md3dDevice->CreateCommittedResource(&hdrHeapProps,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&mLocalContacts)),"Contact lighting image creation failed.");
         md3dDevice->CreateShaderResourceView(mLocalContacts.Get(),nullptr,cpuDescriptor(ContactSrv));
         md3dDevice->CreateUnorderedAccessView(mLocalContacts.Get(),nullptr,nullptr,cpuDescriptor(ContactUav));
@@ -779,7 +802,7 @@ bool D3DApp::InitDirect3D() {
 
     CD3DX12_HEAP_PROPERTIES depthHeapProps(D3D12_HEAP_TYPE_DEFAULT);
     CD3DX12_RESOURCE_DESC depthDesc = CD3DX12_RESOURCE_DESC::Tex2D(
-        DXGI_FORMAT_R32_TYPELESS, mClientWidth, mClientHeight, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        DXGI_FORMAT_R32_TYPELESS, mRenderWidth, mRenderHeight, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     D3D12_CLEAR_VALUE depthClear = {};
     depthClear.Format = DXGI_FORMAT_D32_FLOAT;
     depthClear.DepthStencil.Depth = 0.0f;
@@ -1079,6 +1102,27 @@ bool D3DApp::InitDirect3D() {
     postDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     postDesc.RTVFormats[1] = HdrFormat;
     Check(md3dDevice->CreateGraphicsPipelineState(&postDesc, IID_PPV_ARGS(&mToneMapPSO)), "Tone map PSO creation failed.");
+    {
+        CD3DX12_DESCRIPTOR_RANGE velDepth(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        CD3DX12_DESCRIPTOR_RANGE velColor(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
+        CD3DX12_ROOT_PARAMETER velParams[3];
+        velParams[0].InitAsConstants(32, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        velParams[1].InitAsDescriptorTable(1, &velDepth, D3D12_SHADER_VISIBILITY_PIXEL);
+        velParams[2].InitAsDescriptorTable(1, &velColor, D3D12_SHADER_VISIBILITY_PIXEL);
+        const CD3DX12_ROOT_SIGNATURE_DESC velRoot(_countof(velParams), velParams, 0, nullptr,
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+        mVelocityRoot = CreateRootSignature(md3dDevice.Get(), velRoot);
+        ComPtr<ID3DBlob> velocityPs = LoadShader(L"Velocity.cso");
+        auto velDesc = postDesc;
+        velDesc.pRootSignature = mVelocityRoot.Get();
+        velDesc.PS = CD3DX12_SHADER_BYTECODE(velocityPs.Get());
+        velDesc.NumRenderTargets = 2;
+        velDesc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+        velDesc.RTVFormats[1] = DXGI_FORMAT_R8_UNORM;
+        velDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        velDesc.DepthStencilState.DepthEnable = FALSE;
+        Check(md3dDevice->CreateGraphicsPipelineState(&velDesc, IID_PPV_ARGS(&mVelocityPSO)), "Velocity PSO creation failed.");
+    }
     {   // The local adaptation's first level: the tone map's bindings, one target at a quarter of its resolution.
         const auto seed = LoadShader(L"AdaptSeed.cso");
         auto seedDesc = postDesc;
@@ -1122,7 +1166,7 @@ bool D3DApp::InitDirect3D() {
         blend.SrcBlendAlpha = D3D12_BLEND_ONE; blend.DestBlendAlpha = D3D12_BLEND_ZERO; blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
         Check(md3dDevice->CreateGraphicsPipelineState(&postDesc, IID_PPV_ARGS(&mStarsPSO)), "Stellar pipeline creation failed.");
     }
-    if (mSettings.glare) mGlare.Initialize(md3dDevice.Get(), mClientWidth, mClientHeight, HdrFormat, mComposite.Get());
+    if (mSettings.glare) mGlare.Initialize(md3dDevice.Get(), mRenderWidth, mRenderHeight, HdrFormat, mComposite.Get());
     {   // The tone map's t8: the summed glare, or a null view that reads zero when no glare was drawn this frame.
         const UINT srvStep = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const CD3DX12_CPU_DESCRIPTOR_HANDLE first(mSrvHeap->GetCPUDescriptorHandleForHeapStart(), GlareSrv, srvStep);
@@ -1134,7 +1178,7 @@ bool D3DApp::InitDirect3D() {
         md3dDevice->CreateShaderResourceView(nullptr, &none, CD3DX12_CPU_DESCRIPTOR_HANDLE(first, 1, srvStep));
         if (mSettings.glare) mGlare.CreateSummedSrv(md3dDevice.Get(), first);
         else md3dDevice->CreateShaderResourceView(nullptr, &none, first);
-        mAdaptation.Initialize(md3dDevice.Get(), mClientWidth, mClientHeight);
+        mAdaptation.Initialize(md3dDevice.Get(), mRenderWidth, mRenderHeight);
         mAdaptation.CreateSrv(md3dDevice.Get(), CD3DX12_CPU_DESCRIPTOR_HANDLE(first, AdaptationSrv - GlareSrv, srvStep));
     }
 
@@ -1394,7 +1438,7 @@ bool D3DApp::InitDirect3D() {
     // The selected ship's cooked package, found above the executable (ShipProfiles.h).
     const std::wstring shipPack = FindAbove(mShip.Profile().packPath);
     if (!shipPack.empty()) mShip.Load(shipPack);
-    mShip.Initialize(md3dDevice.Get(), mCommandList.Get(), mSrvHeap.Get(), ShipSrv, mClientWidth, mClientHeight, HdrFormat, SunFormat, mDepthStencilBuffer.Get());
+    mShip.Initialize(md3dDevice.Get(), mCommandList.Get(), mSrvHeap.Get(), ShipSrv, mRenderWidth, mRenderHeight, HdrFormat, SunFormat, mDepthStencilBuffer.Get());
     mCity.Initialize(md3dDevice.Get(),mCommandList.Get(),mSrvHeap.Get(),CitySrv,mSettings.cityAssets,mSettings.seed,HdrFormat,SunFormat);
     if (!mShip.Ready()) mView = View::Free;
     // The plants' catalogue (docs/arbustes-climatiques.md): MYPLANETENGINE_FOLIAGE_ASSETS; else the first built one above
@@ -1433,10 +1477,19 @@ bool D3DApp::InitDirect3D() {
     }
     if (mPlanetFoliage.Enabled()) {
         mPlanetPlantPlacement.Initialize(md3dDevice.Get(), mObjectRootSignature.Get());
-        if (FoliageHiZ::DescriptorCount(mClientWidth, mClientHeight) > 32) throw std::runtime_error("Hi-Z descriptor reservation exceeded.");
-        mFoliageHiZ.Initialize(md3dDevice.Get(), mClientWidth, mClientHeight, mDepthStencilBuffer.Get(),
+        if (FoliageHiZ::DescriptorCount(mRenderWidth, mRenderHeight) > 32) throw std::runtime_error("Hi-Z descriptor reservation exceeded.");
+        mFoliageHiZ.Initialize(md3dDevice.Get(), mRenderWidth, mRenderHeight, mDepthStencilBuffer.Get(),
             CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvHeap->GetCPUDescriptorHandleForHeapStart(), FoliageHiZSrv,
                 md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)), GpuDescriptor(FoliageHiZSrv));
+    }
+    if (mUpscaler == 1 && !FsrActive()) {
+        mFsr = std::make_unique<Upscaler>();
+        if (!mFsr->Init(md3dDevice.Get(), mClientWidth, mClientHeight, mRenderWidth, mRenderHeight)) {
+            mFsr.reset();
+            mUpscaler = 0;
+        } else {
+            CreateUpscaleResources();
+        }
     }
 
     // Atmosphere tables, once: they depend only on the atmosphere's settings. Each reads the previous ones.
@@ -2108,7 +2161,7 @@ void D3DApp::ApplyLocalContacts()
     mCommandList->SetComputeRootDescriptorTable(3,GpuDescriptor(ContactUav));
     mCommandList->SetComputeRootDescriptorTable(4,GpuDescriptor(ContactHdrUav));
     mCommandList->SetPipelineState(mLocalContactPso.Get());
-    mCommandList->Dispatch(((mClientWidth+1)/2+7)/8,((mClientHeight+1)/2+7)/8,1);
+    mCommandList->Dispatch(((mRenderWidth+1)/2+7)/8,((mRenderHeight+1)/2+7)/8,1);
     constexpr auto sceneRead=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_BARRIER resolve[3]={
         CD3DX12_RESOURCE_BARRIER::Transition(mLocalContacts.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -2116,7 +2169,7 @@ void D3DApp::ApplyLocalContacts()
         CD3DX12_RESOURCE_BARRIER::Transition(mSunPart.Get(),sceneRead,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
     mCommandList->ResourceBarrier(3,resolve);
     mCommandList->SetPipelineState(mLocalContactResolvePso.Get());
-    mCommandList->Dispatch((mClientWidth+7)/8,(mClientHeight+7)/8,1);
+    mCommandList->Dispatch((mRenderWidth+7)/8,(mRenderHeight+7)/8,1);
     const D3D12_RESOURCE_BARRIER ready[3]={
         CD3DX12_RESOURCE_BARRIER::Transition(mLocalContacts.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         CD3DX12_RESOURCE_BARRIER::Transition(mHdrTarget.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,sceneRead),
@@ -2156,6 +2209,7 @@ void D3DApp::Draw() {
     const double elapsed = mLastTime.QuadPart ? double(now.QuadPart - mLastTime.QuadPart) / mFrequency.QuadPart : 0.0;
     const float dt = (float)(!mCine.empty() ? 1.0 / mCineFps : std::min(elapsed, 0.1));
     mLastTime = now;
+    mFrameTimeMs = dt * 1000.0f;
     if (mFlightTake.Connected()) {
         const FlightTake::Instruments instruments = {mClock, elapsed, mShipPos.x, mShipPos.y, mShipPos.z,
             mShipForward.x, mShipForward.y, mShipForward.z, mShipUp.x, mShipUp.y, mShipUp.z,
@@ -2200,7 +2254,7 @@ void D3DApp::Draw() {
     const Vec3d up=Normalize(bodyCamera);
     const double camAltitude=Length(bodyCamera)-bodyRadius;
     const double clearance=std::max(camAltitude-mGroundHeight,.01);
-    const double pixelAngle=2*std::tan(mCineFov*XM_PI/360)/mClientHeight;
+    const double pixelAngle=2*std::tan(mCineFov*XM_PI/360)/mRenderHeight;
     const double reliefPixels=kMaxElevation/(Length(mCamPos)*pixelAngle);
     const double proxyRise=mDiagnosticView!=0?0:std::min(std::max((.5-reliefPixels)/.25,0.0),1.0);
     const float earthProxy=airless?1.0f:float(proxyRise*proxyRise*(3-2*proxyRise));
@@ -2238,7 +2292,7 @@ void D3DApp::Draw() {
         const double limit = nearLimit * ringLimit / std::hypot(nearLimit, ringLimit);
         mMeshOffset = surfaceDetailed && !trembleTest
             ? TerrainFocus::Offset(bodyCamera, mCamForward, mCamUp, std::tan(mCineFov * XM_PI / 360.0),
-                                   double(mClientWidth) / mClientHeight, bodyRadius, meshGround, limit)
+                                   double(mRenderWidth) / mRenderHeight, bodyRadius, meshGround, limit)
             : Vec3d{};
 
         // Face frame: z is the nadir, x is anchored on the north so the face does not twist with the heading.
@@ -2329,7 +2383,15 @@ void D3DApp::Draw() {
     // Fixed 5 cm near plane preserves nearby cliffs; infinite reversed Z also preserves astronomical bodies.
     const float nearZ=0.05f;
     const float focal=1.0f/std::tan(fovY*.5f);
-    const XMMATRIX proj=XMMatrixSet(focal/aspect,0,0,0, 0,focal,0,0, 0,0,0,1, 0,0,nearZ,0);
+    const XMMATRIX projUnj=XMMatrixSet(focal/aspect,0,0,0, 0,focal,0,0, 0,0,0,1, 0,0,nearZ,0);
+    XMMATRIX proj=projUnj;
+    mJitterX = mJitterY = 0.0f;
+    if (FsrActive()) {
+        mFsr->JitterOffset((int)mFrameNumber, &mJitterX, &mJitterY);
+        const float jx = 2.0f * mJitterX / float(mRenderWidth);
+        const float jy = -2.0f * mJitterY / float(mRenderHeight);
+        proj=XMMatrixSet(focal/aspect,0,0,0, 0,focal,0,0, jx,jy,0,1, 0,0,nearZ,0);
+    }
 
     // Camera axes, as XMMatrixLookToLH builds them, for the culling in the compute shader.
     const XMVECTOR camForward = XMVector3Normalize(toLocal(mCamForward));
@@ -2355,6 +2417,7 @@ void D3DApp::Draw() {
     toPrevious.m[3][2] = (float)Dot(mPrevFaceZ, move);
     toPrevious.m[3][3] = 1.0f;
     XMStoreFloat4x4(&mConstants->reproject, XMMatrixTranspose(XMLoadFloat4x4(&toPrevious) * mPrevViewProj));
+    XMStoreFloat4x4(&mVelocityReproject, XMMatrixTranspose(XMLoadFloat4x4(&toPrevious) * mPrevViewProjUnjittered));
     // The ship's pixels follow the ship: a point fixed in its frame, carried from this frame's ship to the previous
     // one's, then into the previous camera (ToneMap.hlsl, on visible ship pixels).
     // The planet frame is left-handed (east x north = down): Cross(up, forward) is the right, as for the camera.
@@ -2405,13 +2468,13 @@ void D3DApp::Draw() {
                 float(ground.y/std::max(body.albedo.y,1e-9))};
         }
     }
-    mConstants->taa = { TemporalAA() && mHistoryValid ? 0.1f : 1.0f, mDiagnosticView,
+    mConstants->taa = { (!FsrActive() && TemporalAA() && mHistoryValid) ? 0.1f : 1.0f, mDiagnosticView,
                         (mSettings.noPlants || !mPlanetFoliage.Enabled() ? 1.0f : 0.0f) + (mFoliageFade ? 2.0f : 0.0f)
                             + (mPlanetFoliage.Enabled() ? 0.0f : 4.0f) + 8.0f * float(mFoliageFadeFrame++ & 63u)
                             + (mPlanetFoliage.Diverse() ? 512.0f : 0.0f) + (mPlanetFoliage.ArtDirected() ? 1024.0f : 0.0f)
                             + (mPlanetFoliage.GeneratedBank() ? 2048.0f : 0.0f) + (TemporalAA() ? 4096.0f : 0.0f)
                             + (mSettings.foliageWhiteNoise ? 8192.0f : 0.0f),
-                        2.0f * std::tan(fovY * 0.5f) / float(mClientHeight) };
+                        2.0f * std::tan(fovY * 0.5f) / float(mRenderHeight) };
     // The clouds' frame (Clouds.hlsli, b1). Their diagnostic views of the weather map and of their shadow take the single
     // pass, whatever MYPLANETENGINE_CLOUD_FULL.
     const bool cloudTemporal = mSettings.cloudTemporal && mDiagnosticView != CloudWeatherView && mDiagnosticView != CloudShadowView;
@@ -2475,7 +2538,7 @@ void D3DApp::Draw() {
         if (enabled && valid) {
             const double altitudeKm = mConstants->camVertical.w;
             const double nearestCloudKm = std::max(altitudeKm - 13.0, 1.0); // conservative temporal shell
-            const double threePixels = 6.0 * mCloudConstants->upTan[3] / mClientHeight;
+            const double threePixels = 6.0 * mCloudConstants->upTan[3] / mRenderHeight;
             const double motionThresholdKm = threePixels * nearestCloudKm;
             const double motionKmSquared = Dot(weatherOffsetKm, weatherOffsetKm);
             if (altitudeKm <= 14.0) {
@@ -2501,6 +2564,7 @@ void D3DApp::Draw() {
     else
         mCloudHistoryValid = false; // the history waits for the temporal pass's own next frame
     mPrevViewProj = view * proj;
+    mPrevViewProjUnjittered = view * projUnj;
     mPrevCamPos = mCamPos;
     mPrevFaceX = faceX;
     mPrevFaceY = faceY;
@@ -2519,13 +2583,13 @@ void D3DApp::Draw() {
     // The screen relief, from orbit down to where the fine grid and the per-pixel detail carry the relief to the pixel.
     bool screenCovers = false;
     {
-        const UINT across = (mClientWidth + ScreenReliefScale - 1) / ScreenReliefScale;
-        const UINT down = std::min((mClientHeight + ScreenReliefScale - 1) / ScreenReliefScale, ScreenReliefMaxTexels / across);
+        const UINT across = (mRenderWidth + ScreenReliefScale - 1) / ScreenReliefScale;
+        const UINT down = std::min((mRenderHeight + ScreenReliefScale - 1) / ScreenReliefScale, ScreenReliefMaxTexels / across);
         const double rise = std::min(std::max((camAltitude - ScreenReliefLow) / (ScreenReliefHigh - ScreenReliefLow), 0.0), 1.0);
         const float weight = surfaceDetailed?(float)(rise * rise * (3.0 - 2.0 * rise)):0.0f;
         mConstants->screenRelief = { (float)across, (float)down, weight, (float)ScreenReliefScale };
         // At full weight on every row, the pixel reads the fine grid only at the limb (FineTerrain.hlsl).
-        screenCovers = weight >= 1.0f && down * ScreenReliefScale >= mClientHeight;
+        screenCovers = weight >= 1.0f && down * ScreenReliefScale >= mRenderHeight;
     }
     mConstants->erosionMode = { mErosionMode, screenCovers ? 1u : 0u, mErosionRiverMap ? 1u : 0u, unsigned(mActiveMoon+1) };
     XMStoreFloat4(&mConstants->lightDir, toLocal(mSunDir));
@@ -2784,7 +2848,7 @@ void D3DApp::Draw() {
         placement.cam[i] = (&bodyCamera.x)[i];
         placement.foot[i] = (&foot.x)[i];
     }
-    placement.pixelAngle = 2.0f * std::tan(fovY * 0.5f) / float(mClientHeight);
+    placement.pixelAngle = 2.0f * std::tan(fovY * 0.5f) / float(mRenderHeight);
     placement.flags = (mSettings.objectPop ? 1u : 0u) | (mSettings.objectCensus && mSettings.batch ? 2u : 0u);
     const double plantReach = 0.5 * PlanetPlantWindow * 32.0; // the plants' windows' half width (m): tiles of 32 m
     const double reach = 2.0 * plantReach / bodyRadius;
@@ -2883,8 +2947,8 @@ void D3DApp::Draw() {
     mCommandList->ClearRenderTargetView(sunRtv, kClearColor, 0, nullptr);
     mCommandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
 
-    CD3DX12_VIEWPORT viewport(0.0f, 0.0f, float(mClientWidth), float(mClientHeight));
-    CD3DX12_RECT scissor(0, 0, LONG(mClientWidth), LONG(mClientHeight));
+    CD3DX12_VIEWPORT viewport(0.0f, 0.0f, float(mRenderWidth), float(mRenderHeight));
+    CD3DX12_RECT scissor(0, 0, LONG(mRenderWidth), LONG(mRenderHeight));
     mCommandList->RSSetViewports(1, &viewport);
     mCommandList->RSSetScissorRects(1, &scissor);
     if (shipDrawn)
@@ -2952,7 +3016,7 @@ void D3DApp::Draw() {
         if (mSettings.batch) mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 15);
         if (mSettings.batch) mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 16);
         mPlanetFoliage.CullOccluded(mCommandList.Get(), mConstantBuffer->GetGPUVirtualAddress(), mFoliageHiZ.Srv(),
-            mFoliageHiZ.Width(), mFoliageHiZ.Height(), mFoliageHiZ.MipCount(), mClientWidth, mClientHeight);
+            mFoliageHiZ.Width(), mFoliageHiZ.Height(), mFoliageHiZ.MipCount(), mRenderWidth, mRenderHeight);
         if (mSettings.batch) mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 17);
         // Both colour attachments belong to the same visible surface, also after HiZ.
         mCommandList->OMSetRenderTargets(2, sceneRtvs, FALSE, &dsvHandle);
@@ -3081,7 +3145,7 @@ void D3DApp::Draw() {
         if (mCloudConstants->temporal[3] > 0.0f) {
             const D3D12_CPU_DESCRIPTOR_HANDLE halfRtvs[2] = { rtv(CloudHalfRtv), rtv(CloudHalfRtv + 1) };
             mCommandList->OMSetRenderTargets(2, halfRtvs, FALSE, nullptr);
-            const UINT halfWidth = (mClientWidth + 1) / 2, halfHeight = (mClientHeight + 1) / 2;
+            const UINT halfWidth = (mRenderWidth + 1) / 2, halfHeight = (mRenderHeight + 1) / 2;
             const CD3DX12_VIEWPORT halfViewport(0.0f, 0.0f, float(halfWidth), float(halfHeight));
             const CD3DX12_RECT halfScissor(0, 0, LONG(halfWidth), LONG(halfHeight));
             mCommandList->RSSetViewports(1, &halfViewport);
@@ -3096,7 +3160,7 @@ void D3DApp::Draw() {
         mCommandList->ResourceBarrier(2, halfToRead);
         const D3D12_CPU_DESCRIPTOR_HANDLE freshRtvs[2] = { rtv(CloudFreshRtv), rtv(CloudFreshRtv + 1) };
         mCommandList->OMSetRenderTargets(2, freshRtvs, FALSE, nullptr);
-        const UINT tileWidth = (mClientWidth + CloudTileX - 1) / CloudTileX, tileHeight = (mClientHeight + CloudTileY - 1) / CloudTileY;
+        const UINT tileWidth = (mRenderWidth + CloudTileX - 1) / CloudTileX, tileHeight = (mRenderHeight + CloudTileY - 1) / CloudTileY;
         const CD3DX12_VIEWPORT tileViewport(0.0f, 0.0f, float(tileWidth), float(tileHeight));
         const CD3DX12_RECT tileScissor(0, 0, LONG(tileWidth), LONG(tileHeight));
         mCommandList->RSSetViewports(1, &tileViewport);
@@ -3182,6 +3246,7 @@ void D3DApp::Draw() {
         mShip.DrawGlass(mCommandList.Get(), shipTables, dsvHandle);
     }
     mShip.OverlayToRead(mCommandList.Get());
+    DrawVelocityAndUpscale();
     {   // The local adaptation: its first level with the tone map's bindings, then its pyramid (Adaptation.h).
         const D3D12_CPU_DESCRIPTOR_HANDLE seedRtv = mAdaptation.SeedTarget();
         const CD3DX12_VIEWPORT seedViewport(0.0f, 0.0f, float(mAdaptation.SeedWidth()), float(mAdaptation.SeedHeight()));
@@ -3198,6 +3263,15 @@ void D3DApp::Draw() {
         mCommandList->DrawInstanced(3, 1, 0, 0);
         mAdaptation.Downsample(mCommandList.Get(), mSrvHeap.Get());
     }
+    if (FsrActive()) {
+        const CD3DX12_VIEWPORT displayViewport(0.0f, 0.0f, float(mClientWidth), float(mClientHeight));
+        const CD3DX12_RECT displayScissor(0, 0, LONG(mClientWidth), LONG(mClientHeight));
+        mCommandList->RSSetViewports(1, &displayViewport);
+        mCommandList->RSSetScissorRects(1, &displayScissor);
+    } else {
+        mCommandList->RSSetViewports(1, &viewport);
+        mCommandList->RSSetScissorRects(1, &scissor);
+    }
     const D3D12_CPU_DESCRIPTOR_HANDLE resolveRtvs[2] = {
         CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart(), mFrameIndex, mRtvDescriptorSize),
         CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart(), HistoryRtv + next, mRtvDescriptorSize) };
@@ -3205,7 +3279,7 @@ void D3DApp::Draw() {
     mCommandList->SetGraphicsRootSignature(mResolveRootSignature.Get());
     mCommandList->SetPipelineState(mToneMapPSO.Get());
     mCommandList->SetGraphicsRootConstantBufferView(0, mConstantBuffer->GetGPUVirtualAddress());
-    mCommandList->SetGraphicsRootDescriptorTable(1, GpuDescriptor(CompositeSrv));
+    mCommandList->SetGraphicsRootDescriptorTable(1, GpuDescriptor(FsrActive() ? UpscaledSrv : CompositeSrv));
     mCommandList->SetGraphicsRootDescriptorTable(2, GpuDescriptor(HistorySrv + mHistoryIndex));
     mCommandList->SetGraphicsRootDescriptorTable(3, GpuDescriptor(LutSrv));
     mCommandList->SetGraphicsRootDescriptorTable(4, mShip.OverlaySrv());
@@ -3233,6 +3307,11 @@ void D3DApp::Draw() {
         CD3DX12_RESOURCE_BARRIER::Transition(mHistory[mHistoryIndex].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_RENDER_TARGET) };
     mCommandList->ResourceBarrier(_countof(afterResolve), afterResolve);
+    if (FsrActive()) {
+        const auto upscaledToUav = CD3DX12_RESOURCE_BARRIER::Transition(mUpscaled.Get(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        mCommandList->ResourceBarrier(1, &upscaledToUav);
+    }
     mHistoryIndex = next;
     mHistoryValid = true;
 
@@ -3303,6 +3382,142 @@ void D3DApp::Draw() {
 
     if (capture) SaveCapture(batchCapture, trembleIndex);
     if (!mCine.empty()) EndCineFrame();
+} 
+
+bool D3DApp::FsrActive() const
+{
+    return mUpscaler == 1 && mFsr && mFsr->Ready();
+}
+
+void D3DApp::CreateUpscaleResources()
+{
+    if (!FsrActive())
+        return;
+    const UINT srvSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto cpuDescriptor = [&](UINT i) { return CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvHeap->GetCPUDescriptorHandleForHeapStart(), i, srvSize); };
+    auto rtv = [&](UINT i) { return CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart(), i, mRtvDescriptorSize); };
+    D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
+    depthSrv.Format = DXGI_FORMAT_R32_FLOAT;
+    depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depthSrv.Texture2D.MipLevels = 1;
+    md3dDevice->CreateShaderResourceView(mDepthStencilBuffer.Get(), &depthSrv, cpuDescriptor(DepthBufferSrv));
+
+    const CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
+    auto velocityDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R16G16_FLOAT, mRenderWidth, mRenderHeight, 1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const float velClearColor[4] = { 0, 0, 0, 0 };
+    const CD3DX12_CLEAR_VALUE velClear(DXGI_FORMAT_R16G16_FLOAT, velClearColor);
+    Check(md3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &velocityDesc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &velClear, IID_PPV_ARGS(&mVelocity)), "Velocity target creation failed.");
+    md3dDevice->CreateRenderTargetView(mVelocity.Get(), nullptr, rtv(VelocityRtv));
+    md3dDevice->CreateShaderResourceView(mVelocity.Get(), nullptr, cpuDescriptor(VelocitySrv));
+
+    auto compDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8_UNORM, mRenderWidth, mRenderHeight, 1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const CD3DX12_CLEAR_VALUE compClear(DXGI_FORMAT_R8_UNORM, velClearColor);
+    Check(md3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &compDesc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, &compClear, IID_PPV_ARGS(&mCompositionMask)), "Composition mask creation failed.");
+    md3dDevice->CreateRenderTargetView(mCompositionMask.Get(), nullptr, rtv(CompositionRtv));
+    md3dDevice->CreateShaderResourceView(mCompositionMask.Get(), nullptr, cpuDescriptor(CompositionSrv));
+
+    auto upDesc = CD3DX12_RESOURCE_DESC::Tex2D(HdrFormat, mClientWidth, mClientHeight, 1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Check(md3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &upDesc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&mUpscaled)), "FSR output creation failed.");
+    md3dDevice->CreateShaderResourceView(mUpscaled.Get(), nullptr, cpuDescriptor(UpscaledSrv));
+}
+
+void D3DApp::DrawVelocityAndUpscale()
+{
+    if (!FsrActive())
+        return;
+    auto rtv = [&](UINT i) { return CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart(), i, mRtvDescriptorSize); };
+    CD3DX12_RESOURCE_BARRIER before[2] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(mDepthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(mComposite.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) };
+    mCommandList->ResourceBarrier(2, before);
+
+    const CD3DX12_VIEWPORT renderViewport(0.0f, 0.0f, float(mRenderWidth), float(mRenderHeight));
+    const CD3DX12_RECT renderScissor(0, 0, LONG(mRenderWidth), LONG(mRenderHeight));
+    mCommandList->RSSetViewports(1, &renderViewport);
+    mCommandList->RSSetScissorRects(1, &renderScissor);
+    const D3D12_CPU_DESCRIPTOR_HANDLE velRtvs[2] = { rtv(VelocityRtv), rtv(CompositionRtv) };
+    mCommandList->OMSetRenderTargets(2, velRtvs, FALSE, nullptr);
+    mCommandList->SetGraphicsRootSignature(mVelocityRoot.Get());
+    mCommandList->SetPipelineState(mVelocityPSO.Get());
+    struct VelocityConstants {
+        XMFLOAT4X4 reproject;
+        XMFLOAT4 camForward, camRight, camUp, sizeNear;
+    } vel = {};
+    vel.reproject = mVelocityReproject;
+    vel.camForward = mConstants->camForward;
+    vel.camRight = mConstants->camRight;
+    vel.camUp = mConstants->camUp;
+    vel.sizeNear = { float(mRenderWidth), float(mRenderHeight), 0.05f, 0.0f };
+    static_assert(sizeof(VelocityConstants) == 32 * 4, "Velocity root constants must be 32 dwords.");
+    mCommandList->SetGraphicsRoot32BitConstants(0, 32, &vel, 0);
+    mCommandList->SetGraphicsRootDescriptorTable(1, GpuDescriptor(DepthBufferSrv));
+    mCommandList->SetGraphicsRootDescriptorTable(2, GpuDescriptor(CompositeSrv));
+    mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mCommandList->DrawInstanced(3, 1, 0, 0);
+
+    CD3DX12_RESOURCE_BARRIER toFsr[2] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(mVelocity.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(mCompositionMask.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) };
+    mCommandList->ResourceBarrier(2, toFsr);
+
+    const float fovY = XMConvertToRadians((float)mCineFov);
+    const bool ok = mFsr->Dispatch(mCommandList.Get(), mComposite.Get(), mDepthStencilBuffer.Get(),
+        mVelocity.Get(), mCompositionMask.Get(), mUpscaled.Get(),
+        mJitterX, mJitterY, mFrameTimeMs, fovY, mFsrReset, true, 0.2f);
+    mFsrReset = !ok;
+
+    CD3DX12_RESOURCE_BARRIER afterFsr[5] = {
+        CD3DX12_RESOURCE_BARRIER::Transition(mUpscaled.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(mDepthStencilBuffer.Get(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        CD3DX12_RESOURCE_BARRIER::Transition(mVelocity.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET),
+        CD3DX12_RESOURCE_BARRIER::Transition(mCompositionMask.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET),
+        CD3DX12_RESOURCE_BARRIER::Transition(mComposite.Get(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
+    mCommandList->ResourceBarrier(5, afterFsr);
+}
+
+void D3DApp::ChooseRenderSize()
+{
+#ifndef MYPLANETENGINE_HAS_FSR2
+    mUpscaler = 0;
+#endif
+    float scale = 1.0f;
+    if (mUpscaler == 1) {
+        if (mSettings.renderScale > 0.0f)
+            scale = mSettings.renderScale;
+        else {
+            const float ratio[3] = { 1.5f, 1.7f, 2.0f };
+            const int q = (mFsrQuality < 0) ? 0 : (mFsrQuality > 2 ? 2 : mFsrQuality);
+            scale = 1.0f / ratio[q];
+        }
+    }
+    if (scale < 0.25f) scale = 0.25f;
+    if (scale > 1.0f) scale = 1.0f;
+    mRenderWidth = std::max(8u, (UINT)std::lround(float(mClientWidth) * scale) & ~1u);
+    mRenderHeight = std::max(8u, (UINT)std::lround(float(mClientHeight) * scale) & ~1u);
+    if (mRenderWidth > mClientWidth) mRenderWidth = mClientWidth;
+    if (mRenderHeight > mClientHeight) mRenderHeight = mClientHeight;
+    if (mUpscaler != 1) {
+        mRenderWidth = mClientWidth;
+        mRenderHeight = mClientHeight;
+    }
 }
 
 // Adds this frame's GPU times, from the timestamps resolved at the end of the frame.
@@ -3436,6 +3651,12 @@ void D3DApp::UpdateTitle(float dt, double clearance, double halfWidth, UINT ring
         mFullscreen ? L"plein ecran" : L"fenetre",mSettings.vsync ? L"oui" : L"non",
         !mSettings.vsync && mAllowTearing ? L" (tearing autorise)" : L"");
     wcscat_s(title,display);
+    if (FsrActive()) {
+        const wchar_t* q = mFsrQuality == 2 ? L"Performance" : mFsrQuality == 1 ? L"Balanced" : L"Quality";
+        wchar_t fsr[96];
+        swprintf_s(fsr, L" | FSR2 %s %ux%u", q, mRenderWidth, mRenderHeight);
+        wcscat_s(title, fsr);
+    }
     wchar_t tectonics[320];
     swprintf_s(tectonics, L" | tectonique %.0f ms, %.0f Mo, %u volcans en %.0f ms | climat %.0f ms, %.1f Mo | meteo %.0f ms | erosion %.0f ms (reseau %.0f, couloirs %.0f, carte %.0f), %.0f Mo",
         mTectonicMs, mTectonicMb, mVolcanoCount, mVolcanoMs, mClimateMs, mClimateMb, mWeatherMapMs, mErosionMs, mErosionBuildMs, mErosionCoursesMs,

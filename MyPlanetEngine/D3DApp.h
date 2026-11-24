@@ -227,6 +227,25 @@ protected:
     HWND mhMainWnd = nullptr;
     UINT mClientWidth = 1280;
     UINT mClientHeight = 720;
+    UINT mRenderWidth = 1280;   // scene, depth, clouds; equals display unless an upscaler is active
+    UINT mRenderHeight = 720;
+    void ChooseRenderSize();
+    int mUpscaler = 0;             // 0 off, 1 FSR 2 (MYPLANETENGINE_UPSCALER)
+    int mFsrQuality = 0;           // 0 quality, 1 balanced, 2 performance
+    float mJitterX = 0.0f, mJitterY = 0.0f;
+    float mFrameTimeMs = 16.0f;
+    DirectX::XMMATRIX mPrevViewProjUnjittered = DirectX::XMMatrixIdentity();
+    DirectX::XMFLOAT4X4 mVelocityReproject = {};
+    bool mFsrReset = true;
+    Microsoft::WRL::ComPtr<ID3D12Resource> mVelocity;
+    Microsoft::WRL::ComPtr<ID3D12Resource> mCompositionMask;
+    Microsoft::WRL::ComPtr<ID3D12Resource> mUpscaled;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> mVelocityPSO;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> mVelocityRoot;
+    std::unique_ptr<class Upscaler> mFsr;
+    bool FsrActive() const;
+    void CreateUpscaleResources();
+    void DrawVelocityAndUpscale();
     bool mFullscreen = false, mAllowTearing = false;
     RECT mWindowedRect = {};
     std::wstring mGpuName;

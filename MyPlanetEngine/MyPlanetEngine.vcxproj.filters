@@ -69,6 +69,9 @@
     <ClCompile Include="Settings.cpp">
       <Filter>Fichiers sources</Filter>
     </ClCompile>
+    <ClCompile Include="Upscaler.cpp">
+      <Filter>Fichiers sources</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="D3DApp.h">
@@ -141,6 +144,7 @@
     <FxCompile Include="TuftPixel.hlsl" />
     <FxCompile Include="Fullscreen.hlsl" />
     <FxCompile Include="ToneMap.hlsl" />
+    <FxCompile Include="Velocity.hlsl" />
     <FxCompile Include="AdaptSeed.hlsl" />
     <FxCompile Include="GlareDown.hlsl" />
     <FxCompile Include="GlareUp.hlsl" />

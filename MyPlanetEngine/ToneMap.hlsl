@@ -147,12 +147,13 @@ Output PSMain(float4 position : SV_POSITION)
     float2 size;
     composite.GetDimensions(size.x, size.y);
     const int2 pixel = int2(position.xy);
-    const float4 g = glass.Load(int3(pixel, 0));
+    const float2 uv = (position.xy) / size;
+    const float4 g = glass.SampleLevel(linearClamp, uv, 0.0);
     const bool opaqueOverlay = g.a < 0.0;
     const float4 current = opaqueOverlay ? float4(g.rgb, -g.a) : composite.Load(int3(pixel, 0));
     float shipCoverage = opaqueOverlay ? 1.0 : 0.0;
     [branch] if (!opaqueOverlay && shipSphere.w > 0.0)
-        shipCoverage = surfaceSun.Load(int3(pixel, 0)).a > 0.5 ? 1.0 : 0.0;
+        shipCoverage = surfaceSun.SampleLevel(linearClamp, uv, 0.0).a > 0.5 ? 1.0 : 0.0;
     float3 low = current.rgb, high = current.rgb;
     [unroll] for (int dy = -1; dy <= 1; ++dy)
     [unroll] for (int dx = -1; dx <= 1; ++dx)
@@ -198,7 +199,7 @@ Output PSMain(float4 position : SV_POSITION)
     // fallback sample amplifies the first trace of air at the outer limb by up to 15 stops.
     const float sceneExposure=opaqueOverlay?exposure:exposure*exp2(
         LocalMeterWeight(current.a,pixelStops)*LocalAdaptation(position.xy/size,pixelStops));
-    const float3 starlight=opaqueOverlay?0.0:celestial.Load(int3(pixel,0)).rgb*clamp(exposure,SKY_EYE_EXPOSURE,2000000.0);
+    const float3 starlight=opaqueOverlay?0.0:celestial.SampleLevel(linearClamp,uv,0.0).rgb*clamp(exposure,SKY_EYE_EXPOSURE,2000000.0);
     const float3 foreground=RodVision(color*(1.0-glare.a),sceneExposure)*sceneExposure+glare.rgb*exposure;
     // For a source S on visible foreground B, B + S*S/(B+S) is at least as
     // bright as either input as a transparent limb crosses the star field.

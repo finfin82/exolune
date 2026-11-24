@@ -96,6 +96,25 @@ Settings ReadSettings() {
     s.clouds = GetEnvironmentVariableW(L"MYPLANETENGINE_NO_CLOUDS", nullptr, 0) == 0;
     wchar_t full[16] = {};
     s.cloudTemporal = !(GetEnvironmentVariableW(L"MYPLANETENGINE_CLOUD_FULL", full, _countof(full)) > 0 && wcscmp(full, L"1") == 0);
+    wchar_t upscaler[32] = {};
+    if (GetEnvironmentVariableW(L"MYPLANETENGINE_UPSCALER", upscaler, _countof(upscaler)) > 0) {
+        if (wcscmp(upscaler, L"fsr") == 0 || wcscmp(upscaler, L"fsr2") == 0 || wcscmp(upscaler, L"1") == 0)
+            s.upscaler = 1;
+        else
+            s.upscaler = 0;
+    }
+    wchar_t fsrq[32] = {};
+    if (GetEnvironmentVariableW(L"MYPLANETENGINE_FSR_QUALITY", fsrq, _countof(fsrq)) > 0) {
+        if (wcscmp(fsrq, L"balanced") == 0 || wcscmp(fsrq, L"1") == 0) s.fsrQuality = 1;
+        else if (wcscmp(fsrq, L"performance") == 0 || wcscmp(fsrq, L"perf") == 0 || wcscmp(fsrq, L"2") == 0) s.fsrQuality = 2;
+        else s.fsrQuality = 0;
+    }
+    wchar_t scale[32] = {};
+    if (GetEnvironmentVariableW(L"MYPLANETENGINE_RENDER_SCALE", scale, _countof(scale)) > 0) {
+        s.renderScale = float(_wtof(scale));
+        if (s.renderScale < 0.0f) s.renderScale = 0.0f;
+        if (s.renderScale > 1.0f) s.renderScale = 1.0f;
+    }
     wchar_t weather[64] = {};
     if (GetEnvironmentVariableW(L"MYPLANETENGINE_WEATHER_TIME", weather, _countof(weather)) > 0) {
         const double time = _wtof(weather);
