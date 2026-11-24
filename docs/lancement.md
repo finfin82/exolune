@@ -110,8 +110,9 @@ python tools/foliage/bake.py --impostor-only --out assets/foliage/climate_shrubs
 ## Default game and benchmark variables
 
 - **Clouds:** always present, using their temporal pass. Weather starts paused at time 0.
-- **Temporal antialiasing:** enabled at startup; T toggles it. `MYPLANETENGINE_TAA=0` disables it explicitly.
+- **Temporal antialiasing:** enabled at startup; T toggles it. `MYPLANETENGINE_TAA=0` disables it explicitly. When FSR 2 is active it replaces TAA (the T key no longer applies a second temporal pass).
 - **Lens halo:** enabled; linear energy-conserving response before tone mapping.
+- **Optional FSR 2.2:** the default build and the default run are unchanged. To enable AMD FidelityFX Super Resolution 2 as a TAA replacement, first run `tools\build_fsr2.ps1` once (it clones tag `v2.2.1` into `third_party/FidelityFX-FSR2/sdk/` and builds the DX12 static libraries), then rebuild. Set `MYPLANETENGINE_UPSCALER=fsr` and optionally `MYPLANETENGINE_FSR_QUALITY`. License and provenance are in [`NOTICE`](../NOTICE) and [`third_party/FidelityFX-FSR2`](../third_party/FidelityFX-FSR2).
 - **Override variables** for benchmarks and comparisons:
 
 | Variable | Effect |
@@ -121,6 +122,9 @@ python tools/foliage/bake.py --impostor-only --out assets/foliage/climate_shrubs
 | `MYPLANETENGINE_WEATHER_TIME` | Weather time, in seconds |
 | `MYPLANETENGINE_TAA` | Temporal antialiasing; default enabled, explicit `0` disables it |
 | `MYPLANETENGINE_GLARE` | `0` disables optical glare; enabled by default |
+| `MYPLANETENGINE_UPSCALER` | `off` (default) or `fsr` / `fsr2` / `1`. Off keeps the native TAA path and the same render size as the swap chain. FSR 2.2 replaces TAA and renders the scene at a lower resolution. Requires the FSR 2 SDK (see above). |
+| `MYPLANETENGINE_FSR_QUALITY` | `quality` (default, 1.5×), `balanced` (1.7×) or `performance` (2.0×). Used only when the upscaler is FSR. |
+| `MYPLANETENGINE_RENDER_SCALE` | Optional render/display ratio in `[0.25, 1]`. `0` (default) uses the quality preset. |
 | `MYPLANETENGINE_VIEW` | Diagnostic view; terrain views are raw, without clouds or air, except `ground`, the cloud silhouette |
 | `MYPLANETENGINE_SEED` | Another seed for tectonic map and climate, to compare planets; detail noise retains its seed |
 

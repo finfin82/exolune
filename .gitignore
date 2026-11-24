@@ -368,3 +368,8 @@ FodyWeavers.xsd
 *.blend1
 .claude/
 *.npy
+
+# AMD FidelityFX FSR 2 SDK, cloned and built by tools/build_fsr2.ps1
+# Match both a directory and a junction/symlink (no trailing slash).
+/third_party/FidelityFX-FSR2/sdk
+/third_party/FidelityFX-FSR2/sdk/

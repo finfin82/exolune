@@ -116,3 +116,17 @@ Optional flight and suit production audio was generated with ElevenLabs.
 Its provenance and integration terms are in assets/audio/README.md and
 assets/audio/immersion/bank.ini. The public source includes original
 procedural sounds for the same mixer roles.
+
+
+6. Bibliothèque liée, construite hors du dépôt
+==============================================
+
+AMD FidelityFX Super Resolution 2 (FSR 2.2)
+  Copyright (c) 2022-2023 Advanced Micro Devices, Inc.
+  Licence : MIT. Texte : third_party/FidelityFX-FSR2/LICENSE.
+  Source : https://github.com/GPUOpen-Effects/FidelityFX-FSR2,
+  tag v2.2.1, commit 1680d1edd5c034f88ebbbb793d8b88f8842cf804.
+  L'API DX12 est liée par MyPlanetEngine/Upscaler.cpp, de façon optionnelle.
+  tools/build_fsr2.ps1 clone et compile le SDK dans
+  third_party/FidelityFX-FSR2/sdk/, ignoré par git. Sans ce SDK, le moteur
+  compile et s'exécute comme avant (MYPLANETENGINE_UPSCALER reste ignoré).

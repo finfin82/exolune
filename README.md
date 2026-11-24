@@ -95,7 +95,7 @@ That builds the game in Release, about 4 minutes the first time, then opens it f
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\plantes.ps1
 ```
 
-After that, `tools\lance.ps1` alone starts the game. `-Resolution fenetre` opens a window, and `-Parcours tools\tests\<file>.txt` puts a list of viewpoints on F1 to F12. Every option is in [`docs/lancement.md`](docs/lancement.md).
+After that, `tools\lance.ps1` alone starts the game. `-Resolution fenetre` opens a window, and `-Parcours tools\tests\<file>.txt` puts a list of viewpoints on F1 to F12. Every option is in [`docs/lancement.md`](docs/lancement.md). An optional FSR 2.2 path is documented there; it is off by default and needs `tools\build_fsr2.ps1` once before it can be compiled in.
 
 <details>
 <summary><b>Controls</b></summary>
@@ -157,4 +157,4 @@ Start with [`docs/README.md`](docs/README.md), the map of the documentation. It 
 
 Exolune is source available under the **PolyForm Shield License 1.0.0**; see [`LICENSE.md`](LICENSE.md). You may read, use, modify and redistribute it for any purpose other than a product or service that competes with Exolune. Contributions are welcome under a contributor licence agreement; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-The relief, the noise, the climate and the volcanoes are original code. Exolune adapts code and data under MIT licences from Wicked Engine, web-ocean and TileableVolumeNoise; [`NOTICE`](NOTICE) lists every third-party part, its licence and its source.
+The relief, the noise, the climate and the volcanoes are original code. Exolune adapts code and data under MIT licences from Wicked Engine, web-ocean and TileableVolumeNoise, and optionally links AMD FidelityFX Super Resolution 2 (MIT); [`NOTICE`](NOTICE) lists every third-party part, its licence and its source.
